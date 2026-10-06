@@ -1,0 +1,455 @@
+name: Build QA Key Manager APK
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Install Gradle
+        run: |
+          wget -q https://services.gradle.org/distributions/gradle-8.7-bin.zip
+          unzip -q gradle-8.7-bin.zip
+          echo "$PWD/gradle-8.7/bin" >> "$GITHUB_PATH"
+
+      - name: Install Android SDK
+        run: |
+          yes | sdkmanager --licenses >/dev/null || true
+          sdkmanager "platforms;android-35" "build-tools;35.0.0"
+
+      - name: Create Android project
+        run: |
+          mkdir -p app/src/main/java/com/qakeymanager
+          mkdir -p app/src/main/res/values
+
+          cat > settings.gradle <<'EOF'
+          pluginManagement {
+              repositories {
+                  google()
+                  mavenCentral()
+                  gradlePluginPortal()
+              }
+          }
+
+          dependencyResolutionManagement {
+              repositoriesMode.set(RepositoriesMode.FAIL_ON_PROJECT_REPOS)
+              repositories {
+                  google()
+                  mavenCentral()
+              }
+          }
+
+          rootProject.name = "QA-Key-Manager"
+          include(":app")
+          EOF
+
+          cat > build.gradle <<'EOF'
+          plugins {
+              id 'com.android.application' version '8.5.2' apply false
+          }
+          EOF
+
+          cat > gradle.properties <<'EOF'
+          android.useAndroidX=true
+          org.gradle.jvmargs=-Xmx2048m
+          EOF
+
+          cat > app/build.gradle <<'EOF'
+          plugins {
+              id 'com.android.application'
+          }
+
+          android {
+              namespace 'com.qakeymanager'
+              compileSdk 35
+
+              defaultConfig {
+                  applicationId 'com.qakeymanager'
+                  minSdk 26
+                  targetSdk 35
+                  versionCode 1
+                  versionName '1.0'
+              }
+          }
+          EOF
+
+          cat > app/src/main/res/values/styles.xml <<'EOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <resources>
+              <style name="AppTheme"
+                  parent="@android:style/Theme.Material.NoActionBar">
+                  <item name="android:fontFamily">sans</item>
+                  <item name="android:colorAccent">#7C4DFF</item>
+              </style>
+          </resources>
+          EOF
+
+          cat > app/src/main/AndroidManifest.xml <<'EOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+
+              <application
+                  android:theme="@style/AppTheme"
+                  android:label="QA Key Manager"
+                  android:allowBackup="false"
+                  android:supportsRtl="true">
+
+                  <activity
+                      android:name=".MainActivity"
+                      android:screenOrientation="portrait"
+                      android:exported="true">
+
+                      <intent-filter>
+                          <action android:name="android.intent.action.MAIN" />
+                          <category android:name="android.intent.category.LAUNCHER" />
+                      </intent-filter>
+
+                  </activity>
+              </application>
+
+          </manifest>
+          EOF
+
+          cat > app/src/main/java/com/qakeymanager/MainActivity.java <<'EOF'
+          package com.qakeymanager;
+
+          import android.app.Activity;
+          import android.os.Bundle;
+          import android.provider.Settings;
+          import android.graphics.Color;
+          import android.view.Gravity;
+          import android.view.View;
+          import android.widget.*;
+          import java.security.KeyPair;
+          import java.security.KeyPairGenerator;
+          import java.security.KeyStore;
+          import java.security.PrivateKey;
+          import java.security.Signature;
+          import java.text.SimpleDateFormat;
+          import java.util.*;
+          import org.json.JSONArray;
+          import org.json.JSONObject;
+
+          public class MainActivity extends Activity {
+
+              private LinearLayout list;
+              private Spinner duration;
+              private CheckBox bindDevice;
+              private TextView publicKeyText;
+
+              private static final String PREFS = "qa_keys";
+              private static final String STORE = "AndroidKeyStore";
+              private static final String KEY_ALIAS = "QA_KEY_MANAGER_SIGNING";
+
+              @Override
+              protected void onCreate(Bundle b) {
+                  super.onCreate(b);
+
+                  LinearLayout root = new LinearLayout(this);
+                  root.setOrientation(LinearLayout.VERTICAL);
+                  root.setPadding(32, 32, 32, 32);
+                  root.setBackgroundColor(Color.rgb(18,18,18));
+
+                  TextView title = new TextView(this);
+                  title.setText("QA KEY MANAGER");
+                  title.setTextSize(26);
+                  title.setTextColor(Color.WHITE);
+                  title.setGravity(Gravity.CENTER);
+                  title.setPadding(0,0,0,30);
+                  root.addView(title);
+
+                  TextView info = new TextView(this);
+                  info.setText("Создание ключей для собственного QA / тестового контура");
+                  info.setTextColor(Color.LTGRAY);
+                  info.setTextSize(14);
+                  root.addView(info);
+
+                  duration = new Spinner(this);
+                  String[] durations = {"Lifetime", "7 days", "30 days", "90 days"};
+                  duration.setAdapter(new ArrayAdapter<String>(
+                      this,
+                      android.R.layout.simple_spinner_dropdown_item,
+                      durations
+                  ));
+                  root.addView(duration);
+
+                  bindDevice = new CheckBox(this);
+                  bindDevice.setText("Привязать к этому устройству");
+                  bindDevice.setTextColor(Color.WHITE);
+                  root.addView(bindDevice);
+
+                  Button create = new Button(this);
+                  create.setText("CREATE QA KEY");
+                  root.addView(create);
+
+                  Button revoke = new Button(this);
+                  revoke.setText("REVOKE ALL KEYS");
+                  root.addView(revoke);
+
+                  publicKeyText = new TextView(this);
+                  publicKeyText.setTextColor(Color.LTGRAY);
+                  publicKeyText.setTextSize(11);
+                  publicKeyText.setPadding(0,20,0,20);
+                  root.addView(publicKeyText);
+
+                  TextView header = new TextView(this);
+                  header.setText("CREATED KEYS");
+                  header.setTextColor(Color.WHITE);
+                  header.setTextSize(18);
+                  header.setPadding(0,20,0,10);
+                  root.addView(header);
+
+                  ScrollView scroll = new ScrollView(this);
+                  list = new LinearLayout(this);
+                  list.setOrientation(LinearLayout.VERTICAL);
+                  scroll.addView(list);
+                  root.addView(scroll,
+                      new LinearLayout.LayoutParams(
+                          -1, 0, 1
+                      ));
+
+                  setContentView(root);
+
+                  ensureSigningKey();
+                  showPublicKey();
+                  refresh();
+
+                  create.setOnClickListener(v -> createLicense());
+
+                  revoke.setOnClickListener(v -> {
+                      getPreferences(0).edit().putString(PREFS, "[]").apply();
+                      refresh();
+                      Toast.makeText(this, "All local keys revoked", Toast.LENGTH_SHORT).show();
+                  });
+              }
+
+              private void ensureSigningKey() {
+                  try {
+                      KeyStore ks = KeyStore.getInstance(STORE);
+                      ks.load(null);
+
+                      if (!ks.containsAlias(KEY_ALIAS)) {
+                          KeyPairGenerator gen =
+                              KeyPairGenerator.getInstance(
+                                  "EC",
+                                  STORE
+                              );
+
+                          gen.initialize(
+                              new android.security.keystore.KeyGenParameterSpec.Builder(
+                                  KEY_ALIAS,
+                                  android.security.keystore.KeyProperties.PURPOSE_SIGN
+                              )
+                              .setDigests(
+                                  android.security.keystore.KeyProperties.DIGEST_SHA256
+                              )
+                              .build()
+                          );
+
+                          gen.generateKeyPair();
+                      }
+                  } catch (Exception e) {
+                      Toast.makeText(
+                          this,
+                          "Signing key error: " + e.getMessage(),
+                          Toast.LENGTH_LONG
+                      ).show();
+                  }
+              }
+
+              private void showPublicKey() {
+                  try {
+                      KeyStore ks = KeyStore.getInstance(STORE);
+                      ks.load(null);
+
+                      java.security.cert.Certificate cert =
+                          ks.getCertificate(KEY_ALIAS);
+
+                      String key =
+                          Base64.getEncoder().encodeToString(
+                              cert.getPublicKey().getEncoded()
+                          );
+
+                      publicKeyText.setText(
+                          "PUBLIC KEY\n" + key
+                      );
+                  } catch (Exception e) {
+                      publicKeyText.setText(
+                          "Public key unavailable"
+                      );
+                  }
+              }
+
+              private void createLicense() {
+                  try {
+                      String raw = "DEV-QA-" +
+                          randomPart() + "-" +
+                          randomPart() + "-" +
+                          randomPart() + "-" +
+                          randomPart();
+
+                      String device = bindDevice.isChecked()
+                          ? Settings.Secure.getString(
+                              getContentResolver(),
+                              Settings.Secure.ANDROID_ID
+                          )
+                          : "";
+
+                      long now = System.currentTimeMillis();
+                      long expires = 0;
+
+                      int p = duration.getSelectedItemPosition();
+
+                      if (p == 1) expires = now + 7L * 86400000L;
+                      if (p == 2) expires = now + 30L * 86400000L;
+                      if (p == 3) expires = now + 90L * 86400000L;
+
+                      JSONObject obj = new JSONObject();
+                      obj.put("key", raw);
+                      obj.put("created", now);
+                      obj.put("expires", expires);
+                      obj.put("deviceId", device);
+                      obj.put("revoked", false);
+
+                      String signature = sign(obj.toString());
+                      obj.put("signature", signature);
+
+                      String old =
+                          getPreferences(0)
+                          .getString(PREFS, "[]");
+
+                      JSONArray arr = new JSONArray(old);
+                      arr.put(obj);
+
+                      getPreferences(0)
+                          .edit()
+                          .putString(PREFS, arr.toString())
+                          .apply();
+
+                      refresh();
+
+                      Toast.makeText(
+                          this,
+                          raw,
+                          Toast.LENGTH_LONG
+                      ).show();
+
+                  } catch (Exception e) {
+                      Toast.makeText(
+                          this,
+                          "Error: " + e.getMessage(),
+                          Toast.LENGTH_LONG
+                      ).show();
+                  }
+              }
+
+              private String sign(String data) throws Exception {
+                  KeyStore ks = KeyStore.getInstance(STORE);
+                  ks.load(null);
+
+                  PrivateKey privateKey =
+                      (PrivateKey) ks.getKey(KEY_ALIAS, null);
+
+                  Signature s =
+                      Signature.getInstance("SHA256withECDSA");
+
+                  s.initSign(privateKey);
+                  s.update(data.getBytes("UTF-8"));
+
+                  return Base64.getEncoder().encodeToString(
+                      s.sign()
+                  );
+              }
+
+              private String randomPart() {
+                  String chars =
+                      "ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
+
+                  Random r = new Random();
+
+                  StringBuilder s = new StringBuilder();
+
+                  for (int i = 0; i < 4; i++) {
+                      s.append(
+                          chars.charAt(
+                              r.nextInt(chars.length())
+                          )
+                      );
+                  }
+
+                  return s.toString();
+              }
+
+              private void refresh() {
+                  if (list == null) return;
+
+                  list.removeAllViews();
+
+                  try {
+                      String old =
+                          getPreferences(0)
+                          .getString(PREFS, "[]");
+
+                      JSONArray arr = new JSONArray(old);
+
+                      for (int i = 0; i < arr.length(); i++) {
+                          JSONObject o = arr.getJSONObject(i);
+
+                          TextView item = new TextView(this);
+
+                          long exp = o.optLong("expires", 0);
+
+                          String expiry =
+                              exp == 0
+                              ? "Lifetime"
+                              : new SimpleDateFormat(
+                                  "yyyy-MM-dd",
+                                  Locale.US
+                                ).format(
+                                  new Date(exp)
+                                );
+
+                          item.setText(
+                              o.optString("key") +
+                              "\nExpires: " + expiry +
+                              "\nDevice bound: " +
+                              (!o.optString("deviceId").isEmpty())
+                          );
+
+                          item.setTextColor(Color.WHITE);
+                          item.setTextSize(14);
+                          item.setPadding(16,16,16,16);
+
+                          list.addView(item);
+                      }
+
+                  } catch (Exception ignored) {}
+              }
+          }
+          EOF
+
+      - name: Generate Gradle wrapper
+        run: gradle wrapper --gradle-version 8.7
+
+      - name: Build APK
+        run: ./gradlew assembleDebug
+
+      - name: Upload APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: QA-Key-Manager-APK
+          path: app/build/outputs/apk/debug/app-debug.apk
